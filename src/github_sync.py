@@ -23,8 +23,11 @@ import uuid
 from collections.abc import Iterator, Mapping
 from datetime import datetime, timezone
 from typing import Any
+from urllib.parse import quote
 
 import httpx
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ombrebrain.storage.source_store import (
     HARD_MAX_SOURCE_BYTES,
@@ -48,6 +51,13 @@ _MAX_MANIFEST_BASE64_BYTES = ((_MAX_MANIFEST_PAYLOAD_BYTES + 2) // 3) * 4 + 64 *
 _MAX_RESTORE_TOTAL_BYTES = 512 * 1024 * 1024
 _MANIFEST_FILENAME = "_ombre_backup_manifest.json"
 _SOURCE_REFS_COMPLETE_FIELD = "source_refs_complete"
+_PRIVATE_STATE_FILENAME = "_ombre_private_state.enc"
+_PRIVATE_STATE_FILES = (".oauth_clients.json", ".dashboard_mcp_tokens.json")
+_PRIVATE_STATE_MAGIC = b"OMBRE-PRIVATE-STATE-V1\n"
+_PRIVATE_STATE_AAD = b"ombre-brain/private-state/v1"
+_PRIVATE_STATE_SOURCE_MAX_BYTES = 8 * 1024 * 1024
+_PRIVATE_STATE_MAX_BYTES = 12 * 1024 * 1024
+_PRIVATE_STATE_MIN_KEY_BYTES = 32
 
 
 class _LazyMarkdownFiles(Mapping[str, bytes]):
@@ -182,6 +192,7 @@ class GitHubSync:
         branch: str = "main",
         path_prefix: str = "ombre",
         max_source_bytes: int = 2 * 1024 * 1024,
+        state_key: str = "",
     ):
         self.token = token
         self.repo = repo.strip()          # "owner/repo"
@@ -192,6 +203,11 @@ class GitHubSync:
             configured_source_limit or HARD_MAX_SOURCE_BYTES,
             HARD_MAX_SOURCE_BYTES,
         )
+        self._state_key_secret = state_key.strip()
+        if self._state_key_secret and len(self._state_key_secret.encode("utf-8")) < _PRIVATE_STATE_MIN_KEY_BYTES:
+            raise ValueError(
+                f"OMBRE_GITHUB_STATE_KEY must be at least {_PRIVATE_STATE_MIN_KEY_BYTES} UTF-8 bytes"
+            )
 
         self._headers = {
             "Authorization": f"token {token}",
@@ -207,6 +223,8 @@ class GitHubSync:
         # A3：连续失败计数。自动备份可能连挂几次而用户毫无察觉（以为有备份其实没有）。
         # 每次成功归零、每次失败 +1，供诊断面板判断要不要升级为醒目告警。
         self.consecutive_failures: int = 0
+        self.last_private_state_backup: str | None = None
+        self.last_private_state_restore: str | None = None
         # Manual and scheduled backups share one instance.  Serializing them
         # prevents two bounded jobs from adding up to an unbounded peak.
         self._sync_lock = asyncio.Lock()
@@ -220,20 +238,38 @@ class GitHubSync:
         async with self._sync_lock:
             try:
                 files = self._collect_files(buckets_dir)
-                if not files:
+                private_state = self._collect_private_state(buckets_dir)
+                if not files and private_state is None:
                     self.last_status = "ok"
                     self.last_error = ""
                     self.last_sync = _now_iso()
                     self.last_count = 0
                     return {"ok": True, "uploaded": 0, "message": "无可同步文件"}
 
-                count = await self._batch_commit(files)
+                if files:
+                    count = await self._batch_commit(files)
+                else:
+                    # Do not publish an empty manifest over an existing remote
+                    # backup merely because a local ephemeral vault is empty.
+                    # A truly empty repository still needs one initial commit
+                    # before the Contents API can write encrypted state.
+                    await self._ensure_branch_for_private_state()
+                    count = 0
+                private_state_backed_up = False
+                if private_state is not None:
+                    await self._upload_private_state(private_state)
+                    self.last_private_state_backup = _now_iso()
+                    private_state_backed_up = True
                 self.last_sync = _now_iso()
                 self.last_status = "ok"
                 self.last_error = ""
                 self.last_count = count
                 self.consecutive_failures = 0
-                return {"ok": True, "uploaded": count}
+                return {
+                    "ok": True,
+                    "uploaded": count,
+                    "private_state_backed_up": private_state_backed_up,
+                }
             except Exception as e:
                 self.last_status = "error"
                 self.last_error = str(e)
@@ -250,6 +286,54 @@ class GitHubSync:
         """
         async with self._sync_lock:
             return await self._import_from_github_locked(buckets_dir)
+
+    async def restore_private_state(
+        self,
+        buckets_dir: str,
+        *,
+        overwrite: bool = False,
+    ) -> dict[str, Any]:
+        """Restore encrypted OAuth client/grant state from a private repo.
+
+        The secret key is supplied only through deployment configuration.  The
+        GitHub repository must itself be private, and existing local state is
+        never replaced during normal boot restoration.
+        """
+        if not self.private_state_enabled:
+            return {
+                "ok": True,
+                "enabled": False,
+                "restored": 0,
+                "message": "encrypted private-state backup is not configured",
+            }
+        async with self._sync_lock:
+            try:
+                blob = await self._download_private_state()
+                if blob is None:
+                    return {
+                        "ok": True,
+                        "enabled": True,
+                        "restored": 0,
+                        "message": "no encrypted private-state backup exists yet",
+                    }
+                restored, skipped = self._install_private_state(
+                    buckets_dir, blob, overwrite=overwrite
+                )
+                self.last_private_state_restore = _now_iso()
+                return {
+                    "ok": True,
+                    "enabled": True,
+                    "restored": restored,
+                    "skipped": skipped,
+                }
+            except Exception as exc:
+                logger.error("[github_sync] private-state restore failed: %s", exc)
+                return {
+                    "ok": False,
+                    "enabled": True,
+                    "restored": 0,
+                    "error": str(exc)[:500],
+                }
 
     async def _import_from_github_locked(self, buckets_dir: str) -> dict[str, Any]:
         """Serialized implementation shared with the backup lock."""
@@ -601,7 +685,14 @@ class GitHubSync:
             "last_count": self.last_count,
             "is_validated": self.is_validated,
             "consecutive_failures": self.consecutive_failures,
+            "private_state_enabled": self.private_state_enabled,
+            "last_private_state_backup": self.last_private_state_backup,
+            "last_private_state_restore": self.last_private_state_restore,
         }
+
+    @property
+    def private_state_enabled(self) -> bool:
+        return bool(self._state_key_secret)
 
     # --------------------------------------------------------
     # 内部实现
@@ -648,6 +739,224 @@ class GitHubSync:
             except OSError as e:
                 logger.warning(f"[github_sync] skip {os.path.basename(full)}: {e}")
         return _LazyMarkdownFiles(paths)
+
+    def _private_state_key(self) -> bytes:
+        if not self._state_key_secret:
+            raise RuntimeError("encrypted private-state backup is not configured")
+        return hashlib.sha256(
+            b"ombre-brain/private-state/key/v1\0"
+            + self._state_key_secret.encode("utf-8")
+        ).digest()
+
+    def _collect_private_state(self, buckets_dir: str) -> bytes | None:
+        if not self.private_state_enabled:
+            return None
+        payload_files: dict[str, str] = {}
+        total = 0
+        for filename in _PRIVATE_STATE_FILES:
+            path = os.path.join(buckets_dir, filename)
+            if not os.path.exists(path):
+                continue
+            if os.path.islink(path) or not os.path.isfile(path):
+                raise RuntimeError(f"private-state source is not a regular file: {filename}")
+            with open(path, "rb") as handle:
+                data = handle.read(_PRIVATE_STATE_SOURCE_MAX_BYTES + 1)
+            total += len(data)
+            if (
+                len(data) > _PRIVATE_STATE_SOURCE_MAX_BYTES
+                or total > _PRIVATE_STATE_SOURCE_MAX_BYTES
+            ):
+                raise RuntimeError("private OAuth state exceeds the encrypted backup limit")
+            try:
+                parsed = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"private-state source is not valid JSON: {filename}") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"private-state source must be a JSON object: {filename}")
+            payload_files[filename] = base64.b64encode(data).decode("ascii")
+        if not payload_files:
+            return None
+        plaintext = json.dumps(
+            {
+                "schema_version": 1,
+                "created_at": _now_iso(),
+                "files": payload_files,
+            },
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        nonce = os.urandom(12)
+        ciphertext = AESGCM(self._private_state_key()).encrypt(
+            nonce, plaintext, _PRIVATE_STATE_AAD
+        )
+        return _PRIVATE_STATE_MAGIC + nonce + ciphertext
+
+    def _install_private_state(
+        self,
+        buckets_dir: str,
+        blob: bytes,
+        *,
+        overwrite: bool,
+    ) -> tuple[int, int]:
+        if not blob.startswith(_PRIVATE_STATE_MAGIC):
+            raise RuntimeError("encrypted private-state backup has an unknown format")
+        encrypted = blob[len(_PRIVATE_STATE_MAGIC):]
+        if len(encrypted) < 12 + 16 or len(encrypted) > _PRIVATE_STATE_MAX_BYTES:
+            raise RuntimeError("encrypted private-state backup has an invalid size")
+        nonce, ciphertext = encrypted[:12], encrypted[12:]
+        try:
+            plaintext = AESGCM(self._private_state_key()).decrypt(
+                nonce, ciphertext, _PRIVATE_STATE_AAD
+            )
+        except InvalidTag as exc:
+            raise RuntimeError(
+                "encrypted private-state backup cannot be decrypted; check OMBRE_GITHUB_STATE_KEY"
+            ) from exc
+        try:
+            payload = json.loads(plaintext.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("decrypted private-state payload is invalid JSON") from exc
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            raise RuntimeError("decrypted private-state payload has an unsupported schema")
+        files = payload.get("files")
+        if not isinstance(files, dict) or any(name not in _PRIVATE_STATE_FILES for name in files):
+            raise RuntimeError("decrypted private-state payload contains unexpected files")
+        os.makedirs(buckets_dir, exist_ok=True)
+        restored = 0
+        skipped = 0
+        for filename in _PRIVATE_STATE_FILES:
+            encoded = files.get(filename)
+            if encoded is None:
+                continue
+            if not isinstance(encoded, str):
+                raise RuntimeError(f"decrypted private-state entry is invalid: {filename}")
+            try:
+                data = base64.b64decode(encoded, validate=True)
+            except Exception as exc:
+                raise RuntimeError(f"decrypted private-state entry is not base64: {filename}") from exc
+            if len(data) > _PRIVATE_STATE_SOURCE_MAX_BYTES:
+                raise RuntimeError(f"decrypted private-state entry is too large: {filename}")
+            try:
+                parsed = json.loads(data.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise RuntimeError(f"decrypted private-state entry is not valid JSON: {filename}") from exc
+            if not isinstance(parsed, dict):
+                raise RuntimeError(f"decrypted private-state entry must be an object: {filename}")
+            destination = os.path.join(buckets_dir, filename)
+            if os.path.exists(destination) and not overwrite:
+                skipped += 1
+                continue
+            if os.path.lexists(destination) and os.path.islink(destination):
+                raise RuntimeError(f"private-state destination is a symbolic link: {filename}")
+            temp_path = f"{destination}.{uuid.uuid4().hex}.tmp"
+            try:
+                with open(temp_path, "wb") as handle:
+                    handle.write(data)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                try:
+                    os.chmod(temp_path, 0o600)
+                except OSError:
+                    pass
+                os.replace(temp_path, destination)
+            finally:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            restored += 1
+        return restored, skipped
+
+    def _private_state_remote_path(self) -> str:
+        return (
+            f"{self.path_prefix}/{_PRIVATE_STATE_FILENAME}"
+            if self.path_prefix
+            else _PRIVATE_STATE_FILENAME
+        )
+
+    async def _require_private_repository(self, client: httpx.AsyncClient) -> None:
+        response = await self._request(client, "GET", f"{_API}/repos/{self.repo}")
+        if response.status_code == 404:
+            raise RuntimeError(f"repository {self.repo} does not exist or is not accessible")
+        if response.status_code == 401:
+            raise RuntimeError("GitHub token is invalid or expired")
+        response.raise_for_status()
+        if response.json().get("private") is not True:
+            raise RuntimeError(
+                "refusing to back up OAuth state: the configured GitHub repository is not private"
+            )
+
+    async def _upload_private_state(self, blob: bytes) -> None:
+        remote_path = self._private_state_remote_path()
+        encoded_path = quote(remote_path, safe="/")
+        async with httpx.AsyncClient(headers=self._headers, timeout=_TIMEOUT) as client:
+            await self._require_private_repository(client)
+            get_url = (
+                f"{_API}/repos/{self.repo}/contents/{encoded_path}"
+                f"?ref={quote(self.branch, safe='')}"
+            )
+            current = await self._request(client, "GET", get_url)
+            current_sha = ""
+            if current.status_code == 200:
+                current_sha = str(current.json().get("sha") or "")
+            elif current.status_code != 404:
+                current.raise_for_status()
+            body: dict[str, Any] = {
+                "message": f"Ombre Brain encrypted auth state — {_now_iso()}",
+                "content": base64.b64encode(blob).decode("ascii"),
+                "branch": self.branch,
+            }
+            if current_sha:
+                body["sha"] = current_sha
+            response = await self._request(
+                client,
+                "PUT",
+                f"{_API}/repos/{self.repo}/contents/{encoded_path}",
+                json=body,
+            )
+            response.raise_for_status()
+
+    async def _ensure_branch_for_private_state(self) -> None:
+        async with httpx.AsyncClient(
+            headers=self._headers, timeout=_TIMEOUT
+        ) as client:
+            response = await self._request(
+                client,
+                "GET",
+                f"{_API}/repos/{self.repo}/git/ref/heads/{self.branch}",
+            )
+            if _is_empty_repo_response(response):
+                await self._batch_commit({})
+                return
+            if response.status_code == 404:
+                raise RuntimeError(
+                    f"branch {self.branch} does not exist; create it before backing up OAuth state"
+                )
+            response.raise_for_status()
+
+    async def _download_private_state(self) -> bytes | None:
+        remote_path = self._private_state_remote_path()
+        encoded_path = quote(remote_path, safe="/")
+        async with httpx.AsyncClient(headers=self._headers, timeout=_TIMEOUT) as client:
+            await self._require_private_repository(client)
+            response = await self._request(
+                client,
+                "GET",
+                f"{_API}/repos/{self.repo}/contents/{encoded_path}"
+                f"?ref={quote(self.branch, safe='')}",
+            )
+            if response.status_code == 404:
+                return None
+            response.raise_for_status()
+            encoded = response.json().get("content", "")
+            if not isinstance(encoded, str) or len(encoded) > (_PRIVATE_STATE_MAX_BYTES * 2):
+                raise RuntimeError("encrypted private-state response is too large")
+            try:
+                blob = base64.b64decode("".join(encoded.split()), validate=True)
+            except Exception as exc:
+                raise RuntimeError("encrypted private-state response is not valid base64") from exc
+            if len(blob) > _PRIVATE_STATE_MAX_BYTES:
+                raise RuntimeError("encrypted private-state backup exceeds the size limit")
+            return blob
 
     @staticmethod
     def _assert_safe_restore_destination(base: str, relative_path: str) -> None:

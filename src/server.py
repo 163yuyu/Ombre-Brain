@@ -235,16 +235,54 @@ migrate_engine = MigrateEngine(config, bucket_mgr, embedding_engine)            
 # --- GitHub Sync / GitHub 同步 ---
 from github_sync import GitHubSync  # type: ignore
 _gh_cfg = config.get("github_sync", {}) or {}
-_gh_token = (os.environ.get("OMBRE_GITHUB_TOKEN") or _gh_cfg.get("token") or "").strip()
+
+
+def _github_setting(env_name: str, config_name: str, default: str = "") -> str:
+    if env_name in os.environ:
+        return str(os.environ.get(env_name, "")).strip()
+    return str(_gh_cfg.get(config_name, default) or default).strip()
+
+
+def _github_interval() -> int:
+    raw = (
+        os.environ.get("OMBRE_GITHUB_AUTO_INTERVAL_MINUTES")
+        if "OMBRE_GITHUB_AUTO_INTERVAL_MINUTES" in os.environ
+        else _gh_cfg.get("auto_interval_minutes", 0)
+    )
+    try:
+        value = int(raw or 0)
+    except (TypeError, ValueError, OverflowError):
+        logger.warning("GitHub auto-sync interval is invalid; disabling auto-sync")
+        return 0
+    return min(max(value, 0), 10_080)
+
+
+def _github_auto_restore_enabled() -> bool:
+    raw = (
+        os.environ.get("OMBRE_GITHUB_AUTO_RESTORE")
+        if "OMBRE_GITHUB_AUTO_RESTORE" in os.environ
+        else _gh_cfg.get("auto_restore", False)
+    )
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+_gh_token = _github_setting("OMBRE_GITHUB_TOKEN", "token")
+_gh_repo = _github_setting("OMBRE_GITHUB_REPO", "repo")
+_gh_branch = _github_setting("OMBRE_GITHUB_BRANCH", "branch", "main") or "main"
+_gh_path_prefix = _github_setting(
+    "OMBRE_GITHUB_PATH_PREFIX", "path_prefix", "ombre"
+)
+_gh_state_key = str(os.environ.get("OMBRE_GITHUB_STATE_KEY") or "").strip()
 github_sync_instance: GitHubSync | None = (
     GitHubSync(
         token=_gh_token,
-        repo=_gh_cfg.get("repo", ""),
-        branch=_gh_cfg.get("branch", "main"),
-        path_prefix=_gh_cfg.get("path_prefix", "ombre"),
+        repo=_gh_repo,
+        branch=_gh_branch,
+        path_prefix=_gh_path_prefix,
         max_source_bytes=_source_max_bytes,
+        state_key=_gh_state_key,
     )
-    if _gh_token and _gh_cfg.get("repo")
+    if _gh_token and _gh_repo
     else None
 )
 _github_auto_task: "asyncio.Task | None" = None  # 后台定时同步任务
@@ -263,7 +301,6 @@ async def _github_sync_loop(interval_minutes: int) -> None:
         except Exception as e:
             logger.warning(f"[github_sync] auto-sync: validate exception: {e}")
     while True:
-        await asyncio.sleep(interval_minutes * 60)
         inst = _wsh.github_sync_instance  # 读当前全局引用（config 更新可能替换实例）
         if inst is None:
             logger.info("[github_sync] auto-sync: instance gone, stopping loop")
@@ -274,12 +311,15 @@ async def _github_sync_loop(interval_minutes: int) -> None:
                 res = await inst.validate()
                 if not res.get("ok"):
                     logger.warning(f"[github_sync] auto-sync skipped (not validated): {res.get('error')}")
+                    await asyncio.sleep(interval_minutes * 60)
                     continue
             except Exception as e:
                 logger.warning(f"[github_sync] auto-sync validate failed: {e}")
+                await asyncio.sleep(interval_minutes * 60)
                 continue
         buckets_dir = config.get("buckets_dir", "")
         if not buckets_dir:
+            await asyncio.sleep(interval_minutes * 60)
             continue
         try:
             result = await inst.sync(buckets_dir)
@@ -289,6 +329,7 @@ async def _github_sync_loop(interval_minutes: int) -> None:
                 logger.warning(f"[github_sync] auto-sync failed: {result.get('error')}")
         except Exception as e:
             logger.error(f"[github_sync] auto-sync exception: {e}")
+        await asyncio.sleep(interval_minutes * 60)
 
 
 def _restart_github_auto_task(interval_minutes: int) -> None:
@@ -306,8 +347,63 @@ def _restart_github_auto_task(interval_minutes: int) -> None:
             pass  # 没有运行中的 event loop（测试环境），跳过
 
 
-# 启动时若配置了自动同步间隔，推迟到事件循环就绪后启动（用 lifespan 钩子）
-_gh_auto_interval: int = int(_gh_cfg.get("auto_interval_minutes") or 0)
+# 启动时先恢复，再把定时同步任务交给 lifespan 启动。
+_gh_auto_interval: int = _github_interval()
+_gh_auto_restore: bool = _github_auto_restore_enabled()
+
+
+def _vault_has_memory(buckets_dir: str) -> bool:
+    if not buckets_dir or not os.path.isdir(buckets_dir):
+        return False
+    for root, dirs, files in os.walk(buckets_dir):
+        dirs[:] = [name for name in dirs if not name.startswith(".")]
+        if any(name.endswith(".md") and not name.startswith(".") for name in files):
+            return True
+    return False
+
+
+async def _restore_github_on_boot() -> None:
+    """Restore an ephemeral deployment before it starts serving MCP calls."""
+    inst = _wsh.github_sync_instance
+    if not _gh_auto_restore or inst is None:
+        return
+    validation = await inst.validate()
+    if not validation.get("ok"):
+        raise RuntimeError(
+            f"GitHub boot restore validation failed: {validation.get('error', 'unknown error')}"
+        )
+    buckets_dir = str(config.get("buckets_dir") or "")
+    if not _vault_has_memory(buckets_dir):
+        restored_memories = await inst.import_from_github(buckets_dir)
+        if not restored_memories.get("ok"):
+            raise RuntimeError(
+                "GitHub memory restore failed: "
+                + str(restored_memories.get("error") or "unknown error")
+            )
+        try:
+            bucket_mgr._invalidate_bm25()
+        except Exception:
+            pass
+        logger.info(
+            "[github_sync] boot memory restore: %s files",
+            restored_memories.get("imported", 0),
+        )
+    restored_private = await inst.restore_private_state(
+        buckets_dir, overwrite=False
+    )
+    if not restored_private.get("ok"):
+        raise RuntimeError(
+            "GitHub private-state restore failed: "
+            + str(restored_private.get("error") or "unknown error")
+        )
+    if int(restored_private.get("restored", 0) or 0) > 0:
+        from web.oauth import reload_persisted_oauth_state
+
+        reload_persisted_oauth_state()
+        logger.info(
+            "[github_sync] boot OAuth restore: %s files",
+            restored_private.get("restored", 0),
+        )
 
 
 # --- Create MCP server instance / 创建 MCP 服务器实例 ---
@@ -1144,6 +1240,7 @@ if __name__ == "__main__":
             stop_tunnel=_stop_tunnel,
             restart_github_auto_task=_restart_github_auto_task,
             github_auto_interval=_gh_auto_interval,
+            restore_github_on_boot=_restore_github_on_boot,
             boot_marker_path=os.path.join(
                 os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                 ".boot_fails",

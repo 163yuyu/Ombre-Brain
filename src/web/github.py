@@ -35,6 +35,24 @@ except ImportError:  # pragma: no cover
     from ..utils import parse_bool, atomic_update_config_yaml  # type: ignore
 
 
+def _effective_github_value(env_name: str, config_value: object) -> str:
+    if env_name in os.environ:
+        return str(os.environ.get(env_name, "")).strip()
+    return str(config_value or "").strip()
+
+
+def _effective_auto_interval(config_value: object) -> int:
+    raw = (
+        os.environ.get("OMBRE_GITHUB_AUTO_INTERVAL_MINUTES")
+        if "OMBRE_GITHUB_AUTO_INTERVAL_MINUTES" in os.environ
+        else config_value
+    )
+    try:
+        return min(max(int(raw or 0), 0), 10_080)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
 def _save_github_config_to_disk(gh_cfg: dict) -> None:
     """把 github_sync 这一个 key 原子写回 config.yaml，失败即抛异常。
 
@@ -77,7 +95,9 @@ def register(mcp) -> None:
         if err:
             return err
         _gh_cfg_now = sh.config.get("github_sync", {}) or {}
-        _auto_min = int(_gh_cfg_now.get("auto_interval_minutes") or 0)
+        _auto_min = _effective_auto_interval(
+            _gh_cfg_now.get("auto_interval_minutes")
+        )
         _token_set = bool(
             os.environ.get("OMBRE_GITHUB_TOKEN") or _gh_cfg_now.get("token")
         )
@@ -202,12 +222,21 @@ def register(mcp) -> None:
 
         sh.config["github_sync"] = gh_cfg
         # 重建实例。平台环境 token 与启动时语义一致，优先于磁盘值。
-        _tok = str(
-            os.environ.get("OMBRE_GITHUB_TOKEN") or gh_cfg.get("token") or ""
-        ).strip()
-        repo = str(gh_cfg.get("repo") or "").strip()
-        branch = str(gh_cfg.get("branch") or "main").strip() or "main"
-        path_prefix = str(gh_cfg.get("path_prefix", "ombre") or "").strip()
+        _tok = _effective_github_value(
+            "OMBRE_GITHUB_TOKEN", gh_cfg.get("token")
+        )
+        repo = _effective_github_value(
+            "OMBRE_GITHUB_REPO", gh_cfg.get("repo")
+        )
+        branch = (
+            _effective_github_value(
+                "OMBRE_GITHUB_BRANCH", gh_cfg.get("branch") or "main"
+            )
+            or "main"
+        )
+        path_prefix = _effective_github_value(
+            "OMBRE_GITHUB_PATH_PREFIX", gh_cfg.get("path_prefix", "ombre")
+        )
         if _tok and repo:
             sh.github_sync_instance = GitHubSync(
                 token=_tok,
@@ -219,8 +248,13 @@ def register(mcp) -> None:
                         "max_grow_input_bytes", 2 * 1024 * 1024
                     )
                 ),
+                state_key=str(
+                    os.environ.get("OMBRE_GITHUB_STATE_KEY") or ""
+                ).strip(),
             )
-            sh.restart_github_auto_task(auto_interval)
+            sh.restart_github_auto_task(
+                _effective_auto_interval(auto_interval)
+            )
         else:
             sh.github_sync_instance = None
             sh.restart_github_auto_task(0)

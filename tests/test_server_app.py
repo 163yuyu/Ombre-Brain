@@ -1006,6 +1006,55 @@ async def test_runtime_lifecycle_starts_and_stops_every_owned_service(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_runtime_lifecycle_restores_before_starting_auto_sync():
+    events = []
+
+    async def restore():
+        events.append("github:restore")
+
+    lifecycle = RuntimeLifecycle(
+        logger=RecordingLogger(),
+        restore_github_on_boot=restore,
+        restart_github_auto_task=lambda interval: events.append(
+            f"github:auto:{interval}"
+        ),
+        github_auto_interval=1,
+    )
+
+    await lifecycle.start()
+    await lifecycle.stop()
+
+    assert events == [
+        "github:restore",
+        "github:auto:1",
+        "github:auto:0",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_lifecycle_does_not_start_auto_sync_after_restore_failure():
+    events = []
+
+    async def restore():
+        events.append("github:restore")
+        raise RuntimeError("restore failed")
+
+    lifecycle = RuntimeLifecycle(
+        logger=RecordingLogger(),
+        restore_github_on_boot=restore,
+        restart_github_auto_task=lambda interval: events.append(
+            f"github:auto:{interval}"
+        ),
+        github_auto_interval=1,
+    )
+
+    with pytest.raises(RuntimeError, match="restore failed"):
+        await lifecycle.start()
+
+    assert events == ["github:restore"]
+
+
+@pytest.mark.asyncio
 async def test_runtime_lifecycle_cancels_keepalive_on_shutdown():
     lifecycle = RuntimeLifecycle(
         logger=RecordingLogger(),

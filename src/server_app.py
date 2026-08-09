@@ -545,6 +545,7 @@ class RuntimeLifecycle:
     stop_tunnel: Callable[[], Any] | None = None
     restart_github_auto_task: Callable[[int], Any] | None = None
     github_auto_interval: int = 0
+    restore_github_on_boot: AsyncCallback | None = None
     boot_marker_path: str = ""
     keepalive_url: str = ""
     keepalive_initial_delay: float = DEFAULT_KEEPALIVE_INITIAL_DELAY_SECONDS
@@ -607,6 +608,15 @@ class RuntimeLifecycle:
         if self._started:
             return
         self._started = True
+        # A configured restore is a data-safety barrier, not an optional
+        # background convenience.  If it fails, do not start auto-sync against
+        # an empty ephemeral vault and publish an empty backup manifest.
+        if self.restore_github_on_boot is not None:
+            try:
+                await self.restore_github_on_boot()
+            except Exception:
+                self._started = False
+                raise
         self._start_optional_services()
         await self._run_async_step(
             "decay engine start",

@@ -544,6 +544,17 @@ def _load_mcp_tokens() -> None:
         logger.warning(f"[oauth] failed to load mcp tokens: {e}")
 
 
+def reload_persisted_oauth_state() -> dict[str, int]:
+    """Reload OAuth grants and DCR clients after a boot-time restore."""
+    _load_mcp_tokens()
+    _load_oauth_clients()
+    return {
+        "access_tokens": len(_mcp_tokens),
+        "refresh_tokens": len(_mcp_refresh_tokens),
+        "clients": len(_oauth_clients),
+    }
+
+
 def _save_mcp_tokens() -> None:
     """Persist the current grant registry or raise; never report false success."""
     with sh._credential_state_guard():

@@ -45,7 +45,13 @@
 
 ## Tunnel、Hook 与 GitHub
 
-- `OMBRE_GITHUB_TOKEN`：GitHub 备份或更新访问令牌。
+- `OMBRE_GITHUB_TOKEN`：GitHub 备份或更新访问令牌；自动恢复部署需要仓库 Contents 读写权限。
+- `OMBRE_GITHUB_REPO`：环境变量形式的备份仓库（`owner/repo`），优先于临时盘里的面板配置。
+- `OMBRE_GITHUB_BRANCH`：备份分支，默认 `main`。
+- `OMBRE_GITHUB_PATH_PREFIX`：仓库内的备份前缀，默认 `ombre`。
+- `OMBRE_GITHUB_AUTO_INTERVAL_MINUTES`：定时备份间隔；设为 `1` 时启动恢复完成后立即备份，此后每分钟一次。
+- `OMBRE_GITHUB_AUTO_RESTORE`：启动时本地记忆为空则先从 GitHub 恢复；恢复失败会阻止自动同步启动，避免空仓库覆盖有效备份。
+- `OMBRE_GITHUB_STATE_KEY`：至少 32 字节的稳定高熵密钥，用 AES-GCM 加密备份 OAuth `client_id`/grant 状态。只允许配合私有仓库；更换或丢失后旧密文无法恢复。
 - `OMBRE_HOOK_URL`：外部 Hook 地址。
 - `OMBRE_HOOK_TOKEN`：Hook 鉴权令牌。
 - `OMBRE_HOOK_SKIP`：跳过 Hook。

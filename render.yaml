@@ -27,6 +27,23 @@ services:
         sync: false          # e.g. https://generativelanguage.googleapis.com/v1beta/openai/
       - key: OMBRE_COMPRESS_MODEL
         sync: false          # e.g. gemini-2.5-flash
+      # GitHub is the disaster-recovery layer.  On a free/ephemeral service it
+      # is also the primary persistence layer: memories restore before MCP is
+      # served, and OAuth client/grant state is stored only as AES-GCM ciphertext.
+      - key: OMBRE_GITHUB_TOKEN
+        sync: false          # Fine-grained token: private repo Contents read/write
+      - key: OMBRE_GITHUB_REPO
+        sync: false          # e.g. 163yuyu/ombre-memory-test
+      - key: OMBRE_GITHUB_BRANCH
+        value: main
+      - key: OMBRE_GITHUB_PATH_PREFIX
+        value: ombre
+      - key: OMBRE_GITHUB_AUTO_INTERVAL_MINUTES
+        value: "1"
+      - key: OMBRE_GITHUB_AUTO_RESTORE
+        value: "true"
+      - key: OMBRE_GITHUB_STATE_KEY
+        generateValue: true  # Keep stable; changing it makes old OAuth ciphertext unreadable
       # Render services are public as soon as they boot.  Generate a secret at
       # provisioning time so an anonymous first request cannot claim setup.
       - key: OMBRE_DASHBOARD_PASSWORD
