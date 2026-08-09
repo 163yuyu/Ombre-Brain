@@ -51,6 +51,7 @@ from ombrebrain.storage.source_store import SourceStore
 from ombrebrain.security.deployment_profile import enforce_mcp_network_guard
 from import_memory import ImportEngine
 from migrate_engine import MigrateEngine
+from server_app import install_namespaced_tool_compatibility
 from utils import get_version, load_config, setup_logging
 
 # --- iter 2.1：MCP 工具实现已按代码路径拆分到 tools/ 子包 ---
@@ -1167,6 +1168,12 @@ for _strict_tool_name in (
             _strict_tool_name,
             _schema_exc,
         )
+
+
+# ChatGPT/Codex Apps may send ``<connector namespace>.<tool>`` even though
+# tools/list advertises the bare name.  Resolve that shape at FastMCP's final
+# dispatcher as well as at HTTP ingress so every transport follows one rule.
+install_namespaced_tool_compatibility(mcp)
 
 
 # =============================================================

@@ -60,6 +60,45 @@ TokenValidator = Callable[..., bool]
 AsyncCallback = Callable[[], Awaitable[Any]]
 
 
+def install_namespaced_tool_compatibility(
+    mcp: Any,
+    *,
+    tool_names: frozenset[str] = PUBLIC_MCP_TOOL_NAMES,
+) -> None:
+    """Let FastMCP dispatch qualified connector names to known bare tools.
+
+    This is the final dispatch boundary, so it also covers clients or gateways
+    whose request bodies are decoded before the ASGI compatibility middleware
+    can observe them.  ``tools/list`` remains unchanged and an exact registered
+    name always wins before the qualified-name fallback is considered.
+    """
+
+    tool_manager = getattr(mcp, "_tool_manager", None)
+    if tool_manager is None or not callable(getattr(tool_manager, "get_tool", None)):
+        raise RuntimeError("FastMCP tool manager is unavailable")
+    if getattr(tool_manager, "_ombre_namespaced_tool_compatibility", False):
+        return
+
+    original_get_tool = tool_manager.get_tool
+    registered_names = {
+        str(getattr(tool, "name", ""))
+        for tool in tool_manager.list_tools()
+    }
+    allowed_names = frozenset(tool_names).intersection(registered_names)
+
+    def compatible_get_tool(name: str) -> Any:
+        tool = original_get_tool(name)
+        if tool is not None or not isinstance(name, str):
+            return tool
+        namespace, separator, bare_name = name.rpartition(".")
+        if not separator or not namespace or bare_name not in allowed_names:
+            return None
+        return original_get_tool(bare_name)
+
+    tool_manager.get_tool = compatible_get_tool
+    tool_manager._ombre_namespaced_tool_compatibility = True
+
+
 @dataclass(frozen=True)
 class HTTPRuntimeSettings:
     """Normalized settings used while assembling an HTTP MCP application."""

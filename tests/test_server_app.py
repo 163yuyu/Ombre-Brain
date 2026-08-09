@@ -18,6 +18,7 @@ from server_app import (
     OriginCSRFGuardMiddleware,
     RuntimeLifecycle,
     build_http_app,
+    install_namespaced_tool_compatibility,
     install_runtime_lifespan,
 )
 
@@ -295,6 +296,41 @@ async def test_tool_name_compatibility_handles_batches_without_touching_other_ca
     forwarded = json.loads(downstream.bodies[0])
     assert forwarded[0]["params"]["name"] == "hold"
     assert forwarded[1]["params"]["name"] == "ombre.pulse"
+
+
+def test_dispatch_compatibility_resolves_only_known_qualified_tool_names():
+    from mcp.server.fastmcp import FastMCP
+
+    test_mcp = FastMCP("compatibility-test")
+
+    @test_mcp.tool()
+    async def hold(content: str) -> str:
+        return content
+
+    @test_mcp.tool()
+    async def private_helper() -> str:
+        return "private"
+
+    bare_tool = test_mcp._tool_manager.get_tool("hold")
+    install_namespaced_tool_compatibility(
+        test_mcp,
+        tool_names=frozenset({"hold"}),
+    )
+    # Installation is deliberately idempotent because imported and executable
+    # server assembly can share the same FastMCP instance in tests.
+    install_namespaced_tool_compatibility(
+        test_mcp,
+        tool_names=frozenset({"hold"}),
+    )
+
+    assert test_mcp._tool_manager.get_tool("hold") is bare_tool
+    assert test_mcp._tool_manager.get_tool("ombre_brain_yuyu_b.hold") is bare_tool
+    assert test_mcp._tool_manager.get_tool("connector.unknown") is None
+    assert test_mcp._tool_manager.get_tool("connector.private_helper") is None
+    assert [tool.name for tool in test_mcp._tool_manager.list_tools()] == [
+        "hold",
+        "private_helper",
+    ]
 
 
 @pytest.mark.asyncio
