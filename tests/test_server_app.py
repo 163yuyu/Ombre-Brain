@@ -13,6 +13,7 @@ from server_app import (
     HTTPRuntimeSettings,
     MCPJSONAcceptShim,
     MCPAuthMiddleware,
+    MCPToolNameCompatibilityMiddleware,
     NgrokHeaderMiddleware,
     OriginCSRFGuardMiddleware,
     RuntimeLifecycle,
@@ -65,6 +66,24 @@ class RecordingASGIApp:
         self.scopes.append(scope)
         await send({"type": "http.response.start", "status": 204, "headers": []})
         await send({"type": "http.response.body", "body": b""})
+
+
+class BodyRecordingASGIApp(RecordingASGIApp):
+    def __init__(self):
+        super().__init__()
+        self.bodies = []
+
+    async def __call__(self, scope, receive, send):
+        body = bytearray()
+        while True:
+            message = await receive()
+            if message.get("type") != "http.request":
+                break
+            body.extend(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+        self.bodies.append(bytes(body))
+        await super().__call__(scope, receive, send)
 
 
 async def _empty_receive():
@@ -173,6 +192,109 @@ async def test_json_accept_shim_preserves_explicit_or_non_mcp_accept(path, accep
     await middleware(scope, _empty_receive, _discard_send)
 
     assert downstream.scopes[0] is scope
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tool_name", "expected_name"),
+    [
+        ("ombre_brain_yuyu_b.hold", "hold"),
+        ("chatgpt.connector.pulse", "pulse"),
+        ("hold", "hold"),
+        ("ombre_brain_yuyu_b.unknown", "ombre_brain_yuyu_b.unknown"),
+        (".hold", ".hold"),
+    ],
+)
+async def test_tool_name_compatibility_rewrites_only_known_qualified_tools(
+    tool_name,
+    expected_name,
+):
+    downstream = BodyRecordingASGIApp()
+    middleware = MCPToolNameCompatibilityMiddleware(downstream)
+    original_body = json.dumps(
+        {
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": tool_name, "arguments": {"value": "🦦"}},
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    chunks = iter(
+        [
+            {
+                "type": "http.request",
+                "body": original_body[:13],
+                "more_body": True,
+            },
+            {
+                "type": "http.request",
+                "body": original_body[13:],
+                "more_body": False,
+            },
+        ]
+    )
+
+    async def receive():
+        return next(chunks)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/mcp",
+        "headers": [(b"content-length", str(len(original_body)).encode("ascii"))],
+    }
+    await middleware(scope, receive, _discard_send)
+
+    forwarded = json.loads(downstream.bodies[0])
+    assert forwarded["params"]["name"] == expected_name
+    if expected_name != tool_name:
+        assert dict(downstream.scopes[0]["headers"])[b"content-length"] == str(
+            len(downstream.bodies[0])
+        ).encode("ascii")
+    else:
+        assert downstream.bodies[0] == original_body
+        assert downstream.scopes[0] is scope
+
+
+@pytest.mark.asyncio
+async def test_tool_name_compatibility_handles_batches_without_touching_other_calls():
+    downstream = BodyRecordingASGIApp()
+    middleware = MCPToolNameCompatibilityMiddleware(downstream)
+    original_body = json.dumps(
+        [
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "ombre.hold", "arguments": {}},
+            },
+            {
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {"name": "ombre.pulse"},
+            },
+        ]
+    ).encode("utf-8")
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": original_body}
+        return {"type": "http.disconnect"}
+
+    await middleware(
+        {"type": "http", "method": "POST", "path": "/mcp", "headers": []},
+        receive,
+        _discard_send,
+    )
+
+    forwarded = json.loads(downstream.bodies[0])
+    assert forwarded[0]["params"]["name"] == "hold"
+    assert forwarded[1]["params"]["name"] == "ombre.pulse"
 
 
 @pytest.mark.asyncio
@@ -1172,6 +1294,9 @@ def test_build_http_app_uses_same_managed_stack_for_both_http_transports(transpo
     assert ("MCPJSONAcceptShim" in middleware_names) is (
         transport == "streamable-http"
     )
+    assert ("MCPToolNameCompatibilityMiddleware" in middleware_names) is (
+        transport == "streamable-http"
+    )
     csrf_middleware = next(
         item
         for item in app.user_middleware
@@ -1182,6 +1307,10 @@ def test_build_http_app_uses_same_managed_stack_for_both_http_transports(transpo
     assert middleware_order.index("CORSMiddleware") < middleware_order.index(
         "MCPAuthMiddleware"
     )
+    if transport == "streamable-http":
+        assert middleware_order.index("MCPRequestBodyLimitMiddleware") < (
+            middleware_order.index("MCPToolNameCompatibilityMiddleware")
+        )
     cors_middleware = next(
         item for item in app.user_middleware if item.cls.__name__ == "CORSMiddleware"
     )

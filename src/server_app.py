@@ -36,6 +36,25 @@ DEFAULT_MAX_MANAGEMENT_REQUEST_BYTES = 4 * 1024 * 1024
 DEFAULT_HEALTH_PROBE_TIMEOUT_SECONDS = 5.0
 DEFAULT_KEEPALIVE_INITIAL_DELAY_SECONDS = 10.0
 DEFAULT_KEEPALIVE_INTERVAL_SECONDS = 60.0
+PUBLIC_MCP_TOOL_NAMES = frozenset(
+    {
+        "breath",
+        "breath_search",
+        "breath_advanced",
+        "hold",
+        "grow",
+        "source_read",
+        "trace",
+        "dream",
+        "anchor",
+        "release",
+        "pulse",
+        "plan",
+        "letter_write",
+        "letter_read",
+        "I",
+    }
+)
 
 TokenValidator = Callable[..., bool]
 AsyncCallback = Callable[[], Awaitable[Any]]
@@ -279,6 +298,122 @@ class MCPAuthMiddleware:
                 )
                 return
         await self.app(scope, receive, send)
+
+
+class MCPToolNameCompatibilityMiddleware:
+    """Accept connector-qualified names for Ombre's existing MCP tools.
+
+    Some ChatGPT/Codex Apps connector paths qualify a selected tool as
+    ``<connector namespace>.<tool name>`` when sending ``tools/call``, while
+    FastMCP registers and dispatches the bare tool name advertised by
+    ``tools/list``.  Strip that namespace only when the suffix is one of the
+    explicitly registered public tools.  Other methods, unknown names, and
+    malformed payloads pass through byte-for-byte.
+    """
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        path_matcher: Callable[[object], bool] = is_mcp_endpoint_path,
+        tool_names: frozenset[str] = PUBLIC_MCP_TOOL_NAMES,
+    ) -> None:
+        self.app = app
+        self.path_matcher = path_matcher
+        self.tool_names = frozenset(tool_names)
+
+    def _rewrite_payload(self, raw_body: bytes) -> bytes:
+        try:
+            payload = json.loads(raw_body)
+        except (TypeError, ValueError, UnicodeDecodeError):
+            return raw_body
+
+        changed = False
+
+        def rewrite_call(message: Any) -> Any:
+            nonlocal changed
+            if not isinstance(message, dict) or message.get("method") != "tools/call":
+                return message
+            params = message.get("params")
+            if not isinstance(params, dict):
+                return message
+            qualified_name = params.get("name")
+            if not isinstance(qualified_name, str):
+                return message
+            namespace, separator, bare_name = qualified_name.rpartition(".")
+            if not separator or not namespace or bare_name not in self.tool_names:
+                return message
+
+            rewritten_params = dict(params)
+            rewritten_params["name"] = bare_name
+            rewritten_message = dict(message)
+            rewritten_message["params"] = rewritten_params
+            changed = True
+            return rewritten_message
+
+        if isinstance(payload, list):
+            rewritten_payload = [rewrite_call(message) for message in payload]
+        else:
+            rewritten_payload = rewrite_call(payload)
+
+        if not changed:
+            return raw_body
+        return json.dumps(
+            rewritten_payload,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+
+    async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
+        if (
+            scope.get("type") != "http"
+            or str(scope.get("method", "GET")).upper() != "POST"
+            or not self.path_matcher(scope.get("path"))
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        body_parts: list[bytes] = []
+        while True:
+            message = await receive()
+            if not isinstance(message, dict):
+                return
+            if message.get("type") == "http.disconnect":
+                return
+            if message.get("type") != "http.request":
+                continue
+            body_parts.append(message.get("body", b""))
+            if not message.get("more_body", False):
+                break
+
+        raw_body = b"".join(body_parts)
+        rewritten_body = self._rewrite_payload(raw_body)
+        if rewritten_body != raw_body:
+            headers = [
+                (key, value)
+                for key, value in scope.get("headers", [])
+                if key.lower() != b"content-length"
+            ]
+            headers.append(
+                (b"content-length", str(len(rewritten_body)).encode("ascii"))
+            )
+            scope = dict(scope)
+            scope["headers"] = headers
+
+        replayed = False
+
+        async def replay_receive() -> dict:
+            nonlocal replayed
+            if not replayed:
+                replayed = True
+                return {
+                    "type": "http.request",
+                    "body": rewritten_body,
+                    "more_body": False,
+                }
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
 
 class MCPJSONAcceptShim:
@@ -714,6 +849,13 @@ def build_http_app(
         mcp_path_matcher=mcp_path_matcher,
         public_origin=settings.public_origin,
     )
+    if transport == "streamable-http":
+        # Register before the body limit so Starlette's reverse wrapping keeps
+        # the size guard outside this request-buffering compatibility shim.
+        app.add_middleware(
+            MCPToolNameCompatibilityMiddleware,
+            path_matcher=mcp_path_matcher,
+        )
     app.add_middleware(
         MCPRequestBodyLimitMiddleware,
         max_bytes=settings.max_request_bytes,
